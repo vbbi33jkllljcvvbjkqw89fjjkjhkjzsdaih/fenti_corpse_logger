@@ -12,6 +12,29 @@ CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
 SHARED_SECRET = os.environ.get("RELAY_SHARED_SECRET", "").strip()
 # Render sets PORT; local dev can use RELAY_PORT.
 PORT = int(os.environ.get("PORT", os.environ.get("RELAY_PORT", "8787")))
+# Log full JSON body on each POST (noisy; never enable on a shared relay).
+RELAY_LOG_FULL_BODY = os.environ.get("RELAY_LOG_FULL_BODY", "").strip() in ("1", "true", "yes")
+
+
+def _log_incoming_corpse_payload(incoming):
+    """Safe one-line summary so Render logs show shape without echoing secrets."""
+    if not isinstance(incoming, dict):
+        print(f"[relay] corpse-log incoming type={type(incoming).__name__}", flush=True)
+        return
+    keys = sorted(incoming.keys())
+    emb = incoming.get("embeds")
+    n = len(emb) if isinstance(emb, list) else -1
+    hint = ""
+    if isinstance(emb, list) and emb and isinstance(emb[0], dict):
+        t = emb[0].get("title")
+        if isinstance(t, str) and t:
+            hint = f" first_title_len={len(t)}"
+    print(f"[relay] corpse-log JSON keys={keys} embed_count={n}{hint}", flush=True)
+    if RELAY_LOG_FULL_BODY:
+        try:
+            print(f"[relay] corpse-log FULL_BODY={json.dumps(incoming)[:8000]}", flush=True)
+        except Exception as exc:
+            print(f"[relay] corpse-log FULL_BODY encode error {exc!r}", flush=True)
 
 
 def discord_headers():
@@ -38,11 +61,11 @@ def discord_post_message(payload):
             with urlopen(req, timeout=25) as resp:
                 out = resp.read().decode("utf-8", errors="replace")
                 sc = getattr(resp, "status", None) or getattr(resp, "code", None) or "?"
-                print(f"[relay] Discord POST ok http_status={sc} response_len={len(out)}")
+                print(f"[relay] Discord POST ok http_status={sc} response_len={len(out)}", flush=True)
                 return out
         except HTTPError as exc:
             err_body = exc.read().decode("utf-8", errors="replace")
-            print(f"[relay] Discord HTTPError {exc.code} attempt={attempt} body={err_body[:400]}")
+            print(f"[relay] Discord HTTPError {exc.code} attempt={attempt} body={err_body[:400]}", flush=True)
             if exc.code == 429 and attempt < 4:
                 wait_sec = 2.0
                 try:
@@ -62,7 +85,7 @@ def discord_post_message(payload):
                 if "1015" in err_body or "cloudflare" in err_body.lower():
                     wait_sec = max(wait_sec, 8.0 + attempt * 4.0)
                 wait_sec = min(max(wait_sec, 1.0), 60.0)
-                print(f"[relay] 429/rate-limit backoff sleeping {wait_sec:.2f}s")
+                print(f"[relay] 429/rate-limit backoff sleeping {wait_sec:.2f}s", flush=True)
                 time.sleep(wait_sec)
                 continue
             raise HTTPError(
@@ -78,6 +101,9 @@ def discord_post_message(payload):
 class RelayHandler(BaseHTTPRequestHandler):
     server_version = "FentiCorpseRelay/1.0"
 
+    def _log_access(self, note: str) -> None:
+        print(f"[relay] {note}", flush=True)
+
     def _reply(self, status_code, body):
         raw = json.dumps(body).encode("utf-8")
         self.send_response(status_code)
@@ -87,6 +113,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_GET(self):
+        self._log_access(f"GET {self.path} from {self.client_address[0]}")
         if self.path in ("/", "/health"):
             self._reply(
                 200,
@@ -97,22 +124,42 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "channel_id_set": bool(CHANNEL_ID),
                     "relay_auth_required": bool(SHARED_SECRET),
                     "post_path": "/api/corpse-log",
-                    "note": "Discord bots that only use HTTP to post messages stay offline in the member list; that is normal.",
+                    "note": "This service uses a bot token + channel id (DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID), not a webhook URL. Bots that only POST messages may stay offline in the member list; that is normal.",
+                },
+            )
+            return
+        # Browsers open this URL with GET — only POST is valid for logging.
+        if self.path == "/api/corpse-log" or self.path.startswith("/api/corpse-log?"):
+            self._reply(
+                200,
+                {
+                    "ok": False,
+                    "error": "method_not_allowed",
+                    "hint": "Open this in a browser as GET / or GET /health to verify the service. Logging requires HTTP POST with JSON body + Authorization: Bearer <RELAY_SHARED_SECRET> (from Roblox executor or curl), not a browser visit.",
+                    "try_get": ["/", "/health"],
                 },
             )
             return
         self._reply(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self):
+        self._log_access(f"POST {self.path} from {self.client_address[0]}")
         if self.path != "/api/corpse-log":
             self._reply(404, {"ok": False, "error": "not_found"})
             return
 
         if SHARED_SECRET:
-            auth = self.headers.get("Authorization", "")
-            expected = f"Bearer {SHARED_SECRET}"
+            # Header names are case-insensitive; strip CRLF/spaces from sloppy clients.
+            auth = (self.headers.get("Authorization") or "").strip()
+            expected = f"Bearer {SHARED_SECRET}".strip()
             if auth != expected:
-                print(f"[relay] 401 bad Authorization header (len={len(auth)})")
+                got_secret_part = auth[7:].strip() if auth.lower().startswith("bearer ") else auth
+                print(
+                    f"[relay] 401 unauthorized auth_len={len(auth)} expected_len={len(expected)} "
+                    f"has_bearer_prefix={auth.lower().startswith('bearer ')} bearer_token_len={len(got_secret_part)} "
+                    f"env_secret_len={len(SHARED_SECRET)} — RELAY_SHARED_SECRET on Render must equal the token after 'Bearer '.",
+                    flush=True,
+                )
                 self._reply(401, {"ok": False, "error": "unauthorized"})
                 return
 
@@ -133,6 +180,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._reply(400, {"ok": False, "error": "json_object_required"})
             return
 
+        _log_incoming_corpse_payload(incoming)
+
         outgoing = {
             "username": str(incoming.get("username") or "fenti corpse sniper")[:80],
             "avatar_url": incoming.get("avatar_url"),
@@ -141,33 +190,43 @@ class RelayHandler(BaseHTTPRequestHandler):
         }
 
         if not outgoing["embeds"]:
+            print("[relay] 400 missing or empty embeds after normalize (executor must send embeds: [])", flush=True)
             self._reply(400, {"ok": False, "error": "missing_embeds"})
             return
 
+        print(
+            f"[relay] calling Discord channels/.../messages (embeds={len(outgoing['embeds'])}, "
+            f"channel_id_suffix=…{CHANNEL_ID[-6:] if len(CHANNEL_ID) >= 6 else CHANNEL_ID})",
+            flush=True,
+        )
         try:
             discord_post_message(outgoing)
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            print(f"[relay] Discord HTTPError code={exc.code} detail={detail[:900]}")
+            print(f"[relay] Discord HTTPError code={exc.code} detail={detail[:900]}", flush=True)
             self._reply(
                 502,
                 {"ok": False, "error": "discord_http_error", "status": exc.code, "detail": detail},
             )
             return
         except URLError as exc:
-            print(f"[relay] Discord URLError {exc}")
+            print(f"[relay] Discord URLError {exc}", flush=True)
             self._reply(502, {"ok": False, "error": "discord_network_error", "detail": str(exc)})
             return
         except Exception as exc:
-            print(f"[relay] relay_error {exc!r}")
+            print(f"[relay] relay_error {exc!r}", flush=True)
             self._reply(500, {"ok": False, "error": "relay_error", "detail": str(exc)})
             return
 
-        print("[relay] POST /api/corpse-log -> Discord ok")
+        print("[relay] POST /api/corpse-log -> Discord ok", flush=True)
         self._reply(200, {"ok": True})
 
     def log_message(self, format, *args):
-        return
+        # Default handler is silent on Render — print so “Logs” shows every hit.
+        try:
+            print("%s - %s" % (self.address_string(), format % args), flush=True)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
