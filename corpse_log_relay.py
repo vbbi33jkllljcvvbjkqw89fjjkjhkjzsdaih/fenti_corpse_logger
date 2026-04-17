@@ -55,7 +55,9 @@ def discord_post_message(payload):
     body_bytes = json.dumps(payload).encode("utf-8")
     hdrs = discord_headers()
 
-    for attempt in range(1, 5):
+    # 429 + Cloudflare 1015 often hits shared host egress (e.g. Render); needs longer waits than API JSON retry_after.
+    max_attempts = 7
+    for attempt in range(1, max_attempts + 1):
         req = Request(url, data=body_bytes, headers=hdrs, method="POST")
         try:
             with urlopen(req, timeout=25) as resp:
@@ -66,7 +68,16 @@ def discord_post_message(payload):
         except HTTPError as exc:
             err_body = exc.read().decode("utf-8", errors="replace")
             print(f"[relay] Discord HTTPError {exc.code} attempt={attempt} body={err_body[:400]}", flush=True)
-            if exc.code == 429 and attempt < 4:
+            is_cf1015 = "1015" in err_body or (
+                exc.code == 429 and "cloudflare" in err_body.lower()
+            )
+            if is_cf1015 and attempt == 1:
+                print(
+                    "[relay] Discord returned Cloudflare 1015 / edge throttle — not your JSON. "
+                    "Common on shared cloud egress; space out messages or run the relay on a VPS with a calmer IP.",
+                    flush=True,
+                )
+            if exc.code == 429 and attempt < max_attempts:
                 wait_sec = 2.0
                 try:
                     j = json.loads(err_body)
@@ -81,10 +92,12 @@ def discord_post_message(payload):
                             wait_sec = max(wait_sec, float(ra) + 0.35)
                 except Exception:
                     pass
-                # 1015 / edge limits: back off longer on last attempts
-                if "1015" in err_body or "cloudflare" in err_body.lower():
-                    wait_sec = max(wait_sec, 8.0 + attempt * 4.0)
-                wait_sec = min(max(wait_sec, 1.0), 60.0)
+                if is_cf1015:
+                    # Do not cap at 60s — CF 1015 often needs longer; still bound so one job cannot hang forever.
+                    wait_sec = max(wait_sec, 20.0 + float(attempt) * 22.0)
+                    wait_sec = min(max(wait_sec, 5.0), 240.0)
+                else:
+                    wait_sec = min(max(wait_sec, 1.0), 60.0)
                 print(f"[relay] 429/rate-limit backoff sleeping {wait_sec:.2f}s", flush=True)
                 time.sleep(wait_sec)
                 continue
