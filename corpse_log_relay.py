@@ -1,5 +1,7 @@
+import io
 import json
 import os
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -27,14 +29,50 @@ def discord_post_message(payload):
         raise RuntimeError("DISCORD_CHANNEL_ID is not set")
 
     url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages"
-    req = Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers=discord_headers(),
-        method="POST",
-    )
-    with urlopen(req, timeout=15) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+    body_bytes = json.dumps(payload).encode("utf-8")
+    hdrs = discord_headers()
+
+    for attempt in range(1, 5):
+        req = Request(url, data=body_bytes, headers=hdrs, method="POST")
+        try:
+            with urlopen(req, timeout=25) as resp:
+                out = resp.read().decode("utf-8", errors="replace")
+                sc = getattr(resp, "status", None) or getattr(resp, "code", None) or "?"
+                print(f"[relay] Discord POST ok http_status={sc} response_len={len(out)}")
+                return out
+        except HTTPError as exc:
+            err_body = exc.read().decode("utf-8", errors="replace")
+            print(f"[relay] Discord HTTPError {exc.code} attempt={attempt} body={err_body[:400]}")
+            if exc.code == 429 and attempt < 4:
+                wait_sec = 2.0
+                try:
+                    j = json.loads(err_body)
+                    if isinstance(j, dict) and isinstance(j.get("retry_after"), (int, float)):
+                        wait_sec = float(j["retry_after"]) + 0.6
+                except Exception:
+                    pass
+                try:
+                    if exc.headers:
+                        ra = exc.headers.get("Retry-After") or exc.headers.get("retry-after")
+                        if ra:
+                            wait_sec = max(wait_sec, float(ra) + 0.35)
+                except Exception:
+                    pass
+                # 1015 / edge limits: back off longer on last attempts
+                if "1015" in err_body or "cloudflare" in err_body.lower():
+                    wait_sec = max(wait_sec, 8.0 + attempt * 4.0)
+                wait_sec = min(max(wait_sec, 1.0), 60.0)
+                print(f"[relay] 429/rate-limit backoff sleeping {wait_sec:.2f}s")
+                time.sleep(wait_sec)
+                continue
+            raise HTTPError(
+                exc.url,
+                exc.code,
+                exc.msg,
+                exc.headers,
+                io.BytesIO(err_body.encode("utf-8")),
+            ) from exc
+    raise RuntimeError("Discord POST failed after retries")
 
 
 class RelayHandler(BaseHTTPRequestHandler):
@@ -49,13 +87,17 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_GET(self):
-        if self.path == "/health":
+        if self.path in ("/", "/health"):
             self._reply(
                 200,
                 {
                     "ok": True,
-                    "bot_configured": bool(BOT_TOKEN),
-                    "channel_configured": bool(CHANNEL_ID),
+                    "service": "fenti-corpse-relay",
+                    "bot_token_set": bool(BOT_TOKEN),
+                    "channel_id_set": bool(CHANNEL_ID),
+                    "relay_auth_required": bool(SHARED_SECRET),
+                    "post_path": "/api/corpse-log",
+                    "note": "Discord bots that only use HTTP to post messages stay offline in the member list; that is normal.",
                 },
             )
             return
@@ -70,6 +112,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             auth = self.headers.get("Authorization", "")
             expected = f"Bearer {SHARED_SECRET}"
             if auth != expected:
+                print(f"[relay] 401 bad Authorization header (len={len(auth)})")
                 self._reply(401, {"ok": False, "error": "unauthorized"})
                 return
 
@@ -105,18 +148,22 @@ class RelayHandler(BaseHTTPRequestHandler):
             discord_post_message(outgoing)
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            print(f"[relay] Discord HTTPError code={exc.code} detail={detail[:900]}")
             self._reply(
                 502,
                 {"ok": False, "error": "discord_http_error", "status": exc.code, "detail": detail},
             )
             return
         except URLError as exc:
+            print(f"[relay] Discord URLError {exc}")
             self._reply(502, {"ok": False, "error": "discord_network_error", "detail": str(exc)})
             return
         except Exception as exc:
+            print(f"[relay] relay_error {exc!r}")
             self._reply(500, {"ok": False, "error": "relay_error", "detail": str(exc)})
             return
 
+        print("[relay] POST /api/corpse-log -> Discord ok")
         self._reply(200, {"ok": True})
 
     def log_message(self, format, *args):
@@ -124,6 +171,10 @@ class RelayHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    print(
+        f"[relay] boot PORT={PORT} bot_token={'set' if BOT_TOKEN else 'MISSING'} "
+        f"channel_id={'set' if CHANNEL_ID else 'MISSING'} shared_secret={'set' if SHARED_SECRET else 'off'}"
+    )
     server = ThreadingHTTPServer(("0.0.0.0", PORT), RelayHandler)
-    print(f"Listening on 0.0.0.0:{PORT}")
+    print(f"[relay] listening 0.0.0.0:{PORT}")
     server.serve_forever()
