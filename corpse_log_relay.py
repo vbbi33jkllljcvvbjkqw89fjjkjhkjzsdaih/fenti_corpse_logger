@@ -1,6 +1,8 @@
+import errno
 import io
 import json
 import os
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
@@ -14,6 +16,16 @@ SHARED_SECRET = os.environ.get("RELAY_SHARED_SECRET", "").strip()
 PORT = int(os.environ.get("PORT", os.environ.get("RELAY_PORT", "8787")))
 # Log full JSON body on each POST (noisy; never enable on a shared relay).
 RELAY_LOG_FULL_BODY = os.environ.get("RELAY_LOG_FULL_BODY", "").strip() in ("1", "true", "yes")
+# Default True: return 202 immediately and post to Discord in a background thread (stops Roblox/Render
+# timeouts and BrokenPipeError when CF 1015 forces multi-minute backoff). Set RELAY_ASYNC_DISCORD=0 to wait for Discord in-request.
+def _relay_discord_async() -> bool:
+    v = os.environ.get("RELAY_ASYNC_DISCORD", "").strip().lower()
+    if v in ("0", "false", "no", "off", "sync"):
+        return False
+    return True
+
+
+RELAY_ASYNC_DISCORD = _relay_discord_async()
 
 
 def _log_incoming_corpse_payload(incoming):
@@ -111,6 +123,22 @@ def discord_post_message(payload):
     raise RuntimeError("Discord POST failed after retries")
 
 
+def _deliver_discord_background(outgoing):
+    try:
+        discord_post_message(outgoing)
+        print("[relay] async: Discord delivery finished OK", flush=True)
+    except HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = ""
+        print(f"[relay] async: Discord HTTPError {exc.code} detail={detail[:900]}", flush=True)
+    except URLError as exc:
+        print(f"[relay] async: Discord URLError {exc}", flush=True)
+    except Exception as exc:
+        print(f"[relay] async: delivery error {exc!r}", flush=True)
+
+
 class RelayHandler(BaseHTTPRequestHandler):
     server_version = "FentiCorpseRelay/1.0"
 
@@ -123,7 +151,16 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
+            print(f"[relay] client closed socket before response finished ({type(exc).__name__})", flush=True)
+        except OSError as exc:
+            # WinError 10053 / EPIPE / ECONNRESET when client already disconnected (e.g. long Discord retries).
+            if exc.errno in (errno.EPIPE, errno.ECONNRESET, 10053):
+                print(f"[relay] client gone during response write (errno={exc.errno})", flush=True)
+            else:
+                raise
 
     def do_GET(self):
         self._log_access(f"GET {self.path} from {self.client_address[0]}")
@@ -137,6 +174,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "channel_id_set": bool(CHANNEL_ID),
                     "relay_auth_required": bool(SHARED_SECRET),
                     "post_path": "/api/corpse-log",
+                    "discord_delivery": "async" if RELAY_ASYNC_DISCORD else "sync",
                     "note": "This service uses a bot token + channel id (DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID), not a webhook URL. Bots that only POST messages may stay offline in the member list; that is normal.",
                 },
             )
@@ -212,6 +250,25 @@ class RelayHandler(BaseHTTPRequestHandler):
             f"channel_id_suffix=…{CHANNEL_ID[-6:] if len(CHANNEL_ID) >= 6 else CHANNEL_ID})",
             flush=True,
         )
+        if RELAY_ASYNC_DISCORD:
+            threading.Thread(
+                target=_deliver_discord_background,
+                args=(outgoing,),
+                daemon=True,
+                name="discord-deliver",
+            ).start()
+            print("[relay] POST accepted → Discord delivery async (check logs for CF 1015 / result)", flush=True)
+            self._reply(
+                202,
+                {
+                    "ok": True,
+                    "accepted": True,
+                    "discord": "async",
+                    "hint": "Message is posted in a background thread so long Cloudflare backoffs do not kill the HTTP client. Failures appear only in service logs.",
+                },
+            )
+            return
+
         try:
             discord_post_message(outgoing)
         except HTTPError as exc:
@@ -245,7 +302,8 @@ class RelayHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     print(
         f"[relay] boot PORT={PORT} bot_token={'set' if BOT_TOKEN else 'MISSING'} "
-        f"channel_id={'set' if CHANNEL_ID else 'MISSING'} shared_secret={'set' if SHARED_SECRET else 'off'}"
+        f"channel_id={'set' if CHANNEL_ID else 'MISSING'} shared_secret={'set' if SHARED_SECRET else 'off'} "
+        f"async_discord={'on' if RELAY_ASYNC_DISCORD else 'off (RELAY_ASYNC_DISCORD=0)'}"
     )
     server = ThreadingHTTPServer(("0.0.0.0", PORT), RelayHandler)
     print(f"[relay] listening 0.0.0.0:{PORT}")
