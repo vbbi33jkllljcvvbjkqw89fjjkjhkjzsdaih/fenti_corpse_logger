@@ -2,6 +2,7 @@ import errno
 import io
 import json
 import os
+import queue
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +27,14 @@ def _relay_discord_async() -> bool:
 
 
 RELAY_ASYNC_DISCORD = _relay_discord_async()
+# Bounded queue: one worker drains to Discord so parallel POSTs do not stack concurrent 1015 retry loops.
+try:
+    RELAY_DISCORD_QUEUE_MAX = max(1, int(os.environ.get("RELAY_DISCORD_QUEUE_MAX", "80")))
+except ValueError:
+    RELAY_DISCORD_QUEUE_MAX = 80
+_discord_job_queue: queue.Queue = queue.Queue(maxsize=RELAY_DISCORD_QUEUE_MAX)
+_discord_worker_lock = threading.Lock()
+_discord_worker_started = False
 
 
 def _log_incoming_corpse_payload(incoming):
@@ -139,6 +148,47 @@ def _deliver_discord_background(outgoing):
         print(f"[relay] async: delivery error {exc!r}", flush=True)
 
 
+def _discord_queue_worker_loop():
+    while True:
+        job = _discord_job_queue.get()
+        try:
+            _deliver_discord_background(job)
+        finally:
+            _discord_job_queue.task_done()
+
+
+def _ensure_discord_queue_worker():
+    global _discord_worker_started
+    with _discord_worker_lock:
+        if _discord_worker_started:
+            return
+        _discord_worker_started = True
+        threading.Thread(
+            target=_discord_queue_worker_loop,
+            daemon=True,
+            name="discord-queue-worker",
+        ).start()
+        print("[relay] started single Discord queue worker (serializes outbound posts)", flush=True)
+
+
+def _enqueue_discord_outgoing(outgoing) -> tuple[bool, int]:
+    """Returns (ok, depth_after_put)."""
+    _ensure_discord_queue_worker()
+    depth_before = _discord_job_queue.qsize()
+    try:
+        _discord_job_queue.put_nowait(outgoing)
+    except queue.Full:
+        return False, depth_before
+    depth_after = _discord_job_queue.qsize()
+    if depth_before > 0 or depth_after > 1:
+        print(
+            f"[relay] Discord job queued (was_waiting={depth_before} now_queued≈{depth_after}) — "
+            "single worker avoids parallel Cloudflare 1015 retry storms",
+            flush=True,
+        )
+    return True, depth_after
+
+
 class RelayHandler(BaseHTTPRequestHandler):
     server_version = "FentiCorpseRelay/1.0"
 
@@ -175,6 +225,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "relay_auth_required": bool(SHARED_SECRET),
                     "post_path": "/api/corpse-log",
                     "discord_delivery": "async" if RELAY_ASYNC_DISCORD else "sync",
+                    "discord_queue_max": RELAY_DISCORD_QUEUE_MAX if RELAY_ASYNC_DISCORD else None,
+                    "discord_queue_depth_approx": _discord_job_queue.qsize() if RELAY_ASYNC_DISCORD else None,
                     "note": "This service uses a bot token + channel id (DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID), not a webhook URL. Bots that only POST messages may stay offline in the member list; that is normal.",
                 },
             )
@@ -251,20 +303,31 @@ class RelayHandler(BaseHTTPRequestHandler):
             flush=True,
         )
         if RELAY_ASYNC_DISCORD:
-            threading.Thread(
-                target=_deliver_discord_background,
-                args=(outgoing,),
-                daemon=True,
-                name="discord-deliver",
-            ).start()
-            print("[relay] POST accepted → Discord delivery async (check logs for CF 1015 / result)", flush=True)
+            ok_q, depth = _enqueue_discord_outgoing(outgoing)
+            if not ok_q:
+                print(
+                    f"[relay] 503 discord queue full (max={RELAY_DISCORD_QUEUE_MAX}) — slow consumer / CF 1015; retry later",
+                    flush=True,
+                )
+                self._reply(
+                    503,
+                    {
+                        "ok": False,
+                        "error": "discord_queue_full",
+                        "max": RELAY_DISCORD_QUEUE_MAX,
+                        "hint": "Too many pending Discord deliveries. Wait and retry, or host relay on calmer egress if CF 1015 persists.",
+                    },
+                )
+                return
+            print("[relay] POST accepted → Discord delivery queued (check logs for CF 1015 / result)", flush=True)
             self._reply(
                 202,
                 {
                     "ok": True,
                     "accepted": True,
                     "discord": "async",
-                    "hint": "Message is posted in a background thread so long Cloudflare backoffs do not kill the HTTP client. Failures appear only in service logs.",
+                    "queue_depth_approx": depth,
+                    "hint": "One background worker drains the queue so concurrent posts do not parallelize 1015 retries. Failures appear only in service logs.",
                 },
             )
             return
@@ -303,8 +366,11 @@ if __name__ == "__main__":
     print(
         f"[relay] boot PORT={PORT} bot_token={'set' if BOT_TOKEN else 'MISSING'} "
         f"channel_id={'set' if CHANNEL_ID else 'MISSING'} shared_secret={'set' if SHARED_SECRET else 'off'} "
-        f"async_discord={'on' if RELAY_ASYNC_DISCORD else 'off (RELAY_ASYNC_DISCORD=0)'}"
+        f"async_discord={'on' if RELAY_ASYNC_DISCORD else 'off (RELAY_ASYNC_DISCORD=0)'} "
+        f"discord_queue_max={RELAY_DISCORD_QUEUE_MAX if RELAY_ASYNC_DISCORD else 'n/a'}"
     )
+    if RELAY_ASYNC_DISCORD:
+        _ensure_discord_queue_worker()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), RelayHandler)
     print(f"[relay] listening 0.0.0.0:{PORT}")
     server.serve_forever()
